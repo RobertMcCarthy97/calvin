@@ -115,6 +115,7 @@ class DiskDataset(BaseDataset):
 
         ep_start_end_ids = lang_data["info"]["indx"]  # each of them are 64
         lang_ann = lang_data["language"]["emb"]  # length total number of annotations
+        self.lang_ann_str = lang_data["language"]["ann"] # TODO
         lang_lookup = []
         for i, (start_idx, end_idx) in enumerate(ep_start_end_ids):
             if self.pretrain:

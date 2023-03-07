@@ -101,6 +101,7 @@ class BaseDataset(Dataset):
         Returns:
             Loaded sequence.
         """
+        
         if isinstance(idx, int):
             # When max_ws_size and min_ws_size are equal, avoid unnecessary padding
             # acts like Constant dataset. Currently, used for language data

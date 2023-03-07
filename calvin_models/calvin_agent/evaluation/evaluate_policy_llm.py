@@ -145,11 +145,21 @@ def rollout(env, model, task_oracle, subtask, val_annotations, plans, debug):
     if debug:
         print(f"{subtask} ", end="")
         time.sleep(0.5)
+    
     obs = env.get_obs()
-    # get lang annotation for subtask
-    lang_annotation = val_annotations[subtask][0]
     model.reset()
     start_info = env.get_info()
+    
+    if debug:
+        img = env.render(mode="rgb_array")
+        join_vis_lang(img, "awaiting subtask...")
+    
+    # custom subtask
+    subtask = user_select_subtask(val_annotations)
+    # get lang annotation for subtask
+    lang_annotation = val_annotations[subtask][0]
+    
+    obs_list = []
 
     for step in range(EP_LEN):
         action = model.step(obs, lang_annotation)
@@ -162,16 +172,142 @@ def rollout(env, model, task_oracle, subtask, val_annotations, plans, debug):
             # for tsne plot, only if available
             collect_plan(model, plans, subtask)
 
+        # append obs
+        obs_list += [obs]
         # check if current step solves a task
         current_task_info = task_oracle.get_task_info_for_set(start_info, current_info, {subtask})
         if len(current_task_info) > 0:
             if debug:
                 print(colored("success", "green"), end=" ")
+            classify_action(obs_list, lang_annotation, val_annotations, model)
             return True
     if debug:
         print(colored("fail", "red"), end=" ")
+        
+    classify_action(obs_list, lang_annotation, val_annotations, model)
     return False
 
+
+def user_select_subtask(val_annotations):
+    print()
+    for i, key in enumerate(val_annotations.keys()):
+        print(f"[{i}] {key}")
+        # print(f"[{i}] {val_annotations[key][0]}")
+    print()
+    selected_i = int(input("Select subtask to perform [i]: "))
+    subtask = list(val_annotations.keys())[selected_i]
+    print(f"\nYou selected {subtask} ({val_annotations[subtask]})")
+    input()
+    return subtask
+
+def convert_obs_list_to_batch(obs_list, use="end", vlm_len=31, skip=1):
+    vlm_len = skip * vlm_len
+    
+    # only do last 32
+    seq_len = len(obs_list)
+    
+    if use == "end":
+        start = max(0, seq_len - vlm_len)
+        end = seq_len
+    elif use == "start":
+        start = 0
+        end = min(seq_len, vlm_len)
+    elif use == "middle":
+        start = max(0, int(seq_len/2) - int(vlm_len/2))
+        end = min(seq_len, int(seq_len/2) + int(vlm_len/2))
+    
+    # concat obs into batch
+    rgb_obs_static = []
+    rgb_obs_gripper = []
+    depth_obs = []
+    robot_obs = []
+    count = 0
+    for i, obs in enumerate(obs_list):
+        if (i >= start and i < end and (i % skip) == 0) or (i == end-1):
+            print(f"i added: {i}")
+            rgb_obs_static += [obs['rgb_obs']['rgb_static']]
+            rgb_obs_gripper += [obs['rgb_obs']['rgb_gripper']]
+            depth_obs += [obs['depth_obs']]
+            robot_obs += [obs['robot_obs']]
+            count += 1
+    assert len(robot_obs) <= vlm_len
+    print(f"Batch is {count} frames long\n")
+        
+    rgb_obs_static = torch.cat(rgb_obs_static, dim=1)
+    rgb_obs_gripper = torch.cat(rgb_obs_gripper, dim=1)
+    # depth_obs = torch.cat(depth_obs, dim=1)
+    robot_obs = torch.cat(robot_obs, dim=1)
+    batch = {
+        "rgb_obs": {"rgb_static": rgb_obs_static, "rgb_gripper": rgb_obs_gripper},
+        # "depth_obs": None,
+        "robot_obs": robot_obs
+        }
+    return batch
+
+def convert_lang_to_batch(model, val_annotations):
+    embed_lang_list = []
+    for key, str_goal in val_annotations.items():
+        embedded_lang = torch.from_numpy(model.lang_embeddings[str_goal[0]]).to('cuda').squeeze(0).float()
+        embed_lang_list += [embedded_lang]
+    batch_lang = torch.cat(embed_lang_list, dim=0)
+    return batch_lang
+    
+    
+def classify_action(obs_list, lang_annotation, val_annotations, model):
+    print(f"\nSequence is {len(obs_list)} frames long")
+    batch = convert_obs_list_to_batch(obs_list)
+    batch["lang"] = convert_lang_to_batch(model, val_annotations)
+
+    def convert_dict_to_cuda(torch_dict):
+        cuda_dict = {}
+        for key, value in torch_dict.items():
+            if isinstance(value, dict):
+                cuda_dict[key] = convert_dict_to_cuda(value)
+            else:
+                cuda_dict[key] = value.cuda()
+        return cuda_dict
+    # batch = convert_dict_to_cuda(batch)
+    batch["depth_obs"] = []
+    
+    # perceptual emb
+    perceptual_emb = model.perceptual_encoder(
+        batch["rgb_obs"], batch["depth_obs"], batch["robot_obs"]
+    )
+    # visual features
+    pr_state, seq_vis_feat = model.plan_recognition(perceptual_emb)
+    
+    # lang features
+    encoded_lang = model.language_goal(batch["lang"])
+    
+    # image, lang features
+    image_features, lang_features = model.proj_vis_lang(seq_vis_feat, encoded_lang)
+    
+    #### CLIP loss
+    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+    text_features = lang_features / lang_features.norm(dim=-1, keepdim=True)
+    # cosine similarity as logits
+    logit_scale = model.logit_scale.exp()
+    logits_per_image = logit_scale * image_features @ text_features.t()
+    logits_per_text = logits_per_image.t()
+    
+    logits = logits_per_image[0].numpy(force=True)
+    probs = logits_per_image.softmax(dim=-1).cpu().numpy()
+    max_similarity_i = logits.argmax()
+    results_list = []
+    probs_list = []
+    for i, key in enumerate(val_annotations.keys()):
+        # TODO: print in order of similarity!
+        result_str = f"[{i}] {key}: [{logits[i]}] [{probs[0][i]}]"
+        results_list += [result_str]
+        probs_list += [probs[0][i]]
+    sorted_idxs = sorted(range(len(probs_list)), key=lambda k: probs_list[k])
+    for i in sorted_idxs:
+        print(results_list[i])
+    print()
+    print("CLIP retrieved task:")
+    print(list(val_annotations.keys())[max_similarity_i])
+    input("[ENTER] to continue...")
+        
 
 def main():
     seed_everything(0, workers=True)  # type:ignore
