@@ -140,6 +140,7 @@ class CalvinTaskEnv(gym.Wrapper):
             return goal
         else:
             # Choose random goal
+            raise NotImplementedError()
             return list(self.subtasks_dict.keys())[np.random.randint(len(self.subtasks_dict))]
 
     
@@ -195,9 +196,9 @@ class CalvinVLMEnv(gym.Wrapper):
             if done:
                 # TODO: let it run for a few more frames after success? (may help similarity rewards...)
                 reward, r_info = self.get_video_model_reward(self.obs_buffer, self.active_subtask)
+                info.update(r_info)
             else:
-                reward, r_info = 0, {'max_similarity_task': None}
-            info.update(r_info)
+                reward = 0
         
         # iter counters
         self.obs_buffer.append(obs)
@@ -211,51 +212,32 @@ class CalvinVLMEnv(gym.Wrapper):
         # features
         image_features, text_features = self.get_features_for_reward(obs_list)
         
-        if self.use_prob_reward:
-            # cosine similarity as logits
-            logit_scale = self.model.logit_scale.exp()
-            logits_per_image = logit_scale * image_features @ text_features.t()
-            probs = logits_per_image.softmax(dim=-1)
-            similarity_matrix = probs
+        # cosine similarity as logits
+        logit_scale = self.model.logit_scale.exp()
+        logits_per_image = logit_scale * image_features @ text_features.t()
+        probs = logits_per_image.softmax(dim=-1)
+        
         # cosine similarity
-        else:
-            similarity_matrix = image_features @ text_features.t()
+        similarity_matrix = image_features @ text_features.t()
         
         # reward
         task_i = list(self.subtasks_dict.keys()).index(subtask)
-        reward = similarity_matrix[:, task_i]
+        if self.use_prob_reward:
+            reward = probs[:, task_i]
+        else:
+            reward = similarity_matrix[:, task_i]
         
-        # max similarity
+        # Info - max similarity
         max_i = similarity_matrix[0].numpy(force=True).argmax()
         max_subtask = list(self.subtasks_dict.keys())[max_i]
-        info = {'max_similarity_task': max_subtask} # TODO: check if VLM correct!!!
+        info = {
+            'max_similarity_task': max_subtask, # TODO: check if VLM correct!!!
+            'r_similarity': similarity_matrix[:, task_i].item(),
+            'r_probs': probs[:, task_i].item(),
+            } 
         
         return reward.item(), info
-        
-        # TODO: Use logits???
-        
-        # # cosine similarity as logits
-        # logit_scale = model.logit_scale.exp()
-        # logits_per_image = logit_scale * image_features @ text_features.t()
-        # logits_per_text = logits_per_image.t()
-        
-        # logits = logits_per_image[0].numpy(force=True)
-        # probs = logits_per_image.softmax(dim=-1).cpu().numpy()
-        # max_similarity_i = logits.argmax()
-        # results_list = []
-        # probs_list = []
-        # for i, key in enumerate(val_annotations.keys()):
-        #     # TODO: print in order of similarity!
-        #     result_str = f"[{i}] {key}: [{logits[i]}] [{probs[0][i]}]"
-        #     results_list += [result_str]
-        #     probs_list += [probs[0][i]]
-        # sorted_idxs = sorted(range(len(probs_list)), key=lambda k: probs_list[k])
-        # for i in sorted_idxs:
-        #     print(results_list[i])
-        # print()
-        # print("CLIP retrieved task:")
-        # print(list(val_annotations.keys())[max_similarity_i])
-        # input("[ENTER] to continue...")
+    
     
     def get_features_for_reward(self, obs_list):
         # print(f"\nSequence is {len(obs_list)} frames long")
