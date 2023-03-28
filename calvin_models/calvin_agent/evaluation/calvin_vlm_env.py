@@ -192,6 +192,7 @@ class CalvinVLMEnv(gym.Wrapper):
             # If not done (i.e. not success), check if reached max vlm step, to trigger vlm assesment and done event
             if not done and self.vlm_step_count > self.vlm_max_steps:
                 done = True
+            
             # calc reward
             if done:
                 # TODO: let it run for a few more frames after success? (may help similarity rewards...)
